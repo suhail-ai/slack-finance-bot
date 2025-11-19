@@ -1,14 +1,11 @@
 // /api/ai.js
-const fetch = require('node-fetch');
+const fetch = require("node-fetch");
+
+const GEMINI_URL =
+  `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
 async function askGemini(prompt) {
-  const apiKey = process.env.GEMINI_API_KEY;
-
-  if (!apiKey) throw new Error("Missing GEMINI_API_KEY");
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-
-  const body = {
+  const payload = {
     contents: [
       {
         parts: [{ text: prompt }]
@@ -16,22 +13,22 @@ async function askGemini(prompt) {
     ]
   };
 
-  const res = await fetch(url, {
+  const res = await fetch(GEMINI_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload)
   });
 
-  const text = await res.text();
+  const txt = await res.text();
 
   try {
-    const json = JSON.parse(text);
-    if (json?.contents?.[0]?.parts) {
-      return json.contents[0].parts.map(p => p.text || "").join("\n");
+    const json = JSON.parse(txt);
+    if (json.contents && json.contents[0] && json.contents[0].parts) {
+      return json.contents[0].parts.map((p) => p.text || "").join("\n");
     }
-    return text;
-  } catch (err) {
-    return text;
+    return txt;
+  } catch (e) {
+    return txt;
   }
 }
 
