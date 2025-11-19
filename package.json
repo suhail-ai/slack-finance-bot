@@ -2,9 +2,9 @@
   "name": "slack-finance-bot",
   "version": "1.0.0",
   "license": "MIT",
-  "main": "api/slack.js",
   "dependencies": {
-    "google-spreadsheet": "^4.0.2",
-    "google-auth-library": "^9.0.0"
+    "googleapis": "^121.0.0",
+    "node-fetch": "^2.6.7",
+    "google-spreadsheet": "^3.3.0"
   }
 }
