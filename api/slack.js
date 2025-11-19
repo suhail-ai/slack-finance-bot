@@ -1,55 +1,56 @@
-// /api/slack.js
-
-// ---------- VERCEL RAW BODY FIX ----------
+// ------------------------------
+// Vercel: disable body parsing
+// ------------------------------
 export const config = {
   api: {
     bodyParser: false
   }
 };
 
-// ---------- IMPORTS ----------
-const crypto = require("crypto");
-const fetch = require("node-fetch");
-const getRawBody = require("raw-body");
+import crypto from "crypto";
+import fetch from "node-fetch";
+import { readPendingPayments, readDataForChatbot } from "./sheets";
+import { askGemini } from "./ai";
 
-const { readPendingPayments, readDataForChatbot } = require("./sheets");
-const { askGemini } = require("./ai");
+// ------------------------------
+// Read RAW BODY from Vercel
+// ------------------------------
+function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", chunk => (data += chunk));
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
 
-// ========================================
-// SLACK SIGNATURE VERIFICATION
-// ========================================
+// ------------------------------
+// Signature Verification
+// ------------------------------
 function verifySlackRequest(req) {
   const signingSecret = process.env.SLACK_SIGNING_SECRET;
-
   const timestamp = req.headers["x-slack-request-timestamp"];
   const slackSig = req.headers["x-slack-signature"];
-  const rawBody = req.rawBody || "";
 
   if (!signingSecret || !timestamp || !slackSig) {
     throw new Error("Missing Slack headers");
   }
 
-  const FIVE_MIN = 60 * 5;
-  if (Math.abs(Math.floor(Date.now() / 1000) - timestamp) > FIVE_MIN) {
-    throw new Error("Old timestamp");
-  }
-
-  const baseString = `v0:${timestamp}:${rawBody}`;
+  const baseString = `v0:${timestamp}:${req.rawBody}`;
   const hmac = crypto
     .createHmac("sha256", signingSecret)
     .update(baseString)
     .digest("hex");
-
   const computed = `v0=${hmac}`;
 
   if (!crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(slackSig))) {
-    throw new Error("Invalid Slack signature");
+    throw new Error("Signature mismatch");
   }
 }
 
-// ========================================
-// HELPERS
-// ========================================
+// ------------------------------
+// Utility
+// ------------------------------
 function fmt(n) {
   return "€" + Number(n || 0).toLocaleString(undefined, {
     minimumFractionDigits: 2
@@ -57,11 +58,8 @@ function fmt(n) {
 }
 
 function parseMonthIndex(text = "") {
-  const months = [
-    "jan", "feb", "mar", "apr", "may", "jun",
-    "jul", "aug", "sep", "oct", "nov", "dec"
-  ];
-
+  const months = ["jan", "feb", "mar", "apr", "may", "jun", 
+                  "jul", "aug", "sep", "oct", "nov", "dec"];
   text = text.toLowerCase();
   for (let i = 0; i < 12; i++) {
     if (text.includes(months[i])) return i;
@@ -70,13 +68,12 @@ function parseMonthIndex(text = "") {
 }
 
 function daysBetween(dateObj) {
-  if (!dateObj) return "-";
-  return Math.floor((Date.now() - dateObj.getTime()) / (1000 * 60 * 60 * 24));
+    if (!dateObj) return "-";
+    return Math.floor((Date.now() - dateObj.getTime()) / (1000 * 60 * 60 * 24));
 }
 
 async function postMessage(channel, content) {
   const token = process.env.SLACK_BOT_TOKEN;
-
   const body = typeof content === "string"
     ? { channel, text: content }
     : { channel, blocks: content };
@@ -115,8 +112,7 @@ function buildBlocks(title, summary, rows) {
   });
 
   rows.forEach((r) => {
-    const line =
-      `\`${r.invoiceNo}\` | ${r.client} | ${r.date} | ${r.days} | ${r.status} | ${fmt(r.amount)}`;
+    const line = `\`${r.invoiceNo}\` | ${r.client} | ${r.date} | ${r.days} | ${r.status} | ${fmt(r.amount)}`;
     blocks.push({
       type: "section",
       text: { type: "mrkdwn", text: line }
@@ -126,80 +122,55 @@ function buildBlocks(title, summary, rows) {
   return blocks;
 }
 
-// ========================================
-// MAIN HANDLER (VERCEL)
-// ========================================
-module.exports = async (req, res) => {
-  // ------ Get RAW BODY ------
-  const rawBody = await getRawBody(req);
-  req.rawBody = rawBody.toString("utf8");
+// ------------------------------
+// Slack Handler
+// ------------------------------
+export default async function handler(req, res) {
+  // Read raw body BEFORE parsing
+  const raw = await getRawBody(req);
+  req.rawBody = raw;
 
-  // ------ Parse JSON if needed ------
-  try {
-    if ((req.headers["content-type"] || "").includes("application/json")) {
-      req.body = JSON.parse(req.rawBody);
-    }
-  } catch (err) {
-    // ignore JSON parse errors; slash commands are urlencoded
-  }
-
-  // ------ Verify Slack Signature ------
+  // Verify signature
   try {
     verifySlackRequest(req);
   } catch (err) {
-    console.error("Slack verification failed:", err.message);
     return res.status(401).send("Invalid Slack Request: " + err.message);
   }
 
-  // ---------- URL VERIFICATION ----------
-  if (req.body?.type === "url_verification") {
-    return res.json({ challenge: req.body.challenge });
+  // Parse once verified
+  let body = {};
+  try {
+    body = JSON.parse(raw || "{}");
+  } catch (_) {}
+
+  req.body = body;
+
+  // Slack URL verification
+  if (body.type === "url_verification") {
+    return res.status(200).json({ challenge: body.challenge });
   }
 
-  // ---------- SLASH COMMAND ----------
-  const contentType = req.headers["content-type"] || "";
-  if (contentType.includes("application/x-www-form-urlencoded")) {
-    const params = req.body;
-    const text = (params.text || "").trim();
-    const channel = params.channel_id;
+  const text =
+    body?.text?.replace(/<@[^>]+>/, "").trim() ||
+    body?.event?.text?.replace(/<@[^>]+>/, "").trim() ||
+    "";
 
-    res.status(200).send("Processing...");
+  const channel =
+    body?.channel_id || body?.event?.channel;
 
-    (async () => {
-      await postMessage(channel, "Processing… ⏳");
-      await handleCommand(text, channel);
-    })();
+  // Respond immediately (avoid Slack timeout)
+  res.status(200).send("Processing… ⏳");
 
-    return;
-  }
+  await handleCommand(text, channel);
+}
 
-  // ---------- EVENT API ----------
-  if (req.body?.event) {
-    const evt = req.body.event;
-
-    res.status(200).send("ok");
-
-    if (evt.bot_id) return;
-
-    const text = (evt.text || "").replace(/<@[^>]+>/, "").trim();
-    const channel = evt.channel;
-
-    await postMessage(channel, "Processing… ⏳");
-    await handleCommand(text, channel);
-
-    return;
-  }
-
-  res.status(200).send("ok");
-};
-
-// ========================================
-// COMMAND PROCESSOR
-// ========================================
+// ------------------------------
+// Main Bot Logic
+// ------------------------------
 async function handleCommand(text, channel) {
   const lower = text.toLowerCase();
 
-  // -------------- PENDING PAYMENTS --------------
+  // ---------------- Pending Payments ----------------
   if (lower.includes("pending")) {
     const rows = await readPendingPayments();
     const monthIndex = parseMonthIndex(lower);
@@ -215,12 +186,11 @@ async function handleCommand(text, channel) {
 
     let filtered = mapped;
     if (monthIndex !== null) {
-      filtered = filtered.filter((r) => r.date && r.date.getMonth() === monthIndex);
+      filtered = mapped.filter(r => r.date && r.date.getMonth() === monthIndex);
     }
 
     if (filtered.length === 0) {
-      await postMessage(channel, "No pending payments found.");
-      return;
+      return postMessage(channel, "No pending payments found.");
     }
 
     const total = filtered.reduce((s, x) => s + x.amount, 0);
@@ -230,7 +200,7 @@ async function handleCommand(text, channel) {
       filtered.map(f => `${f.invoiceNo}|${f.client}|${fmt(f.amount)}`).join("\n")
     );
 
-    const rowsOut = filtered.map((f) => ({
+    const rowsOut = filtered.map(f => ({
       invoiceNo: f.invoiceNo,
       client: f.client,
       date: f.date ? f.date.toISOString().split("T")[0] : "-",
@@ -239,17 +209,13 @@ async function handleCommand(text, channel) {
       amount: f.amount
     }));
 
-    const blocks = buildBlocks(
-      `Pending Payments — Total ${fmt(total)}`,
-      aiSummary,
-      rowsOut
+    return postMessage(
+      channel,
+      buildBlocks(`Pending Payments — Total ${fmt(total)}`, aiSummary, rowsOut)
     );
-
-    await postMessage(channel, blocks);
-    return;
   }
 
-  // -------------- CASHFLOW --------------
+  // ---------------- Cashflow ----------------
   if (lower.includes("cashflow") || lower.includes("cash")) {
     const rows = await readDataForChatbot();
     const monthIndex = parseMonthIndex(lower);
@@ -265,12 +231,11 @@ async function handleCommand(text, channel) {
 
     let filtered = mapped;
     if (monthIndex !== null) {
-      filtered = filtered.filter((r) => r.date && r.date.getMonth() === monthIndex);
+      filtered = mapped.filter(r => r.date && r.date.getMonth() === monthIndex);
     }
 
     if (filtered.length === 0) {
-      await postMessage(channel, "No cashflow records found.");
-      return;
+      return postMessage(channel, "No cashflow records found.");
     }
 
     const totalInv = filtered.reduce((s, x) => s + x.amount, 0);
@@ -281,7 +246,7 @@ async function handleCommand(text, channel) {
       filtered.map(f => `${f.invoiceNo}|${f.client}|${fmt(f.amount)}`).join("\n")
     );
 
-    const rowsOut = filtered.map((f) => ({
+    const rowsOut = filtered.map(f => ({
       invoiceNo: f.invoiceNo,
       client: f.client,
       date: f.date ? f.date.toISOString().split("T")[0] : "-",
@@ -290,17 +255,13 @@ async function handleCommand(text, channel) {
       amount: f.amount
     }));
 
-    const blocks = buildBlocks(
-      `Cashflow — Total ${fmt(totalInv)}`,
-      aiSummary,
-      rowsOut
+    return postMessage(
+      channel,
+      buildBlocks(`Cashflow — Total ${fmt(totalInv)}`, aiSummary, rowsOut)
     );
-
-    await postMessage(channel, blocks);
-    return;
   }
 
-  // -------------- DEFAULT AI QUESTION --------------
-  const ai = await askGemini(`User asked: "${text}". Answer concisely.`);
-  await postMessage(channel, ai);
+  // ---------------- Fallback AI ----------------
+  const ai = await askGemini(`User asked: "${text}". Answer clearly.`);
+  return postMessage(channel, ai);
 }
