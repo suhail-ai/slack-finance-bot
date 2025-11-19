@@ -1,253 +1,129 @@
-/*****************************************************************
-   Slack Finance Bot – Google Sheets + Gemini (Vercel Version)
-*****************************************************************/
-const crypto = require("crypto");
-const fetch = require("node-fetch");
-const { readPendingPayments, readDataForChatbot } = require("./sheets");
-const { askGemini } = require("./ai");
+import { GoogleSpreadsheet } from "google-spreadsheet";
+import { JWT } from "google-auth-library";
 
-/**************************************
-  VERIFY SLACK SIGNATURE
-**************************************/
-function verifySlackRequest(req) {
-  const secret = process.env.SLACK_SIGNING_SECRET;
-  if (!secret) throw new Error("Missing SLACK_SIGNING_SECRET env");
+// Load env variables
+const SHEET_ID = process.env.SHEET_ID; 
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
+const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n");
 
-  const timestamp = req.headers["x-slack-request-timestamp"];
-  const signature = req.headers["x-slack-signature"];
-  const rawBody = req.rawBody || "";
-
-  // Prevent replay attacks (5 mins)
-  if (Math.abs(Date.now() / 1000 - timestamp) > 60 * 5) {
-    throw new Error("Timestamp too old");
-  }
-
-  const base = `v0:${timestamp}:${rawBody}`;
-  const hash = `v0=${crypto
-    .createHmac("sha256", secret)
-    .update(base)
-    .digest("hex")}`;
-
-  if (!crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(signature))) {
-    throw new Error("Invalid Slack signature");
-  }
-}
-
-/**************************************
-  HELPERS
-**************************************/
-function fmt(amount) {
-  return "€" + Number(amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 });
-}
-
-function monthIndex(text = "") {
-  const months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
-  text = text.toLowerCase();
-  for (let i = 0; i < 12; i++) {
-    if (text.includes(months[i])) return i;
-  }
-  return null;
-}
-
-function daysBetween(date) {
-  if (!date) return "-";
-  return Math.floor((Date.now() - date.getTime()) / (1000 * 60 * 60 * 24));
-}
-
-async function sendSlackMessage(channel, blocksOrText) {
-  const token = process.env.SLACK_BOT_TOKEN;
-
-  const payload =
-    typeof blocksOrText === "string"
-      ? { channel, text: blocksOrText }
-      : { channel, blocks: blocksOrText };
-
-  await fetch("https://slack.com/api/chat.postMessage", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-}
-
-/**************************************
-  BUILD BLOCK KIT TABLE
-**************************************/
-function buildTableBlocks(title, summary, rows) {
-  const blocks = [];
-
-  blocks.push({
-    type: "header",
-    text: { type: "plain_text", text: title },
+// Google Sheets Auth
+async function loadSheet() {
+  const jwt = new JWT({
+    email: GOOGLE_CLIENT_EMAIL,
+    key: GOOGLE_PRIVATE_KEY,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
 
-  blocks.push({
-    type: "section",
-    text: { type: "mrkdwn", text: summary },
-  });
-
-  blocks.push({ type: "divider" });
-
-  blocks.push({
-    type: "section",
-    text: {
-      type: "mrkdwn",
-      text: "*Invoice* | *Client* | *Date* | *Days* | *Status* | *Amount*",
-    },
-  });
-
-  rows.slice(0, 40).forEach((r) => {
-    blocks.push({
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `\`${r.invoiceNo}\` | ${r.client} | ${r.invoiceDate} | ${r.pendingDays} | ${r.status} | ${fmt(r.amount)}`,
-      },
-    });
-  });
-
-  return blocks;
+  const doc = new GoogleSpreadsheet(SHEET_ID, jwt);
+  await doc.loadInfo();
+  return doc;
 }
 
-/**************************************
-  MAIN HANDLER
-**************************************/
-module.exports = async (req, res) => {
+// Gemini call
+async function askGemini(question, sheetData) {
+  const payload = {
+    model: "gemini-1.5-flash",
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { text: "You are a finance assistant. Use ONLY the data below from Google Sheets." },
+          { text: `Sheet Data: ${JSON.stringify(sheetData)}` },
+          { text: `Question: ${question}` },
+        ]
+      }
+    ]
+  };
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  const data = await res.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || "No answer generated.";
+}
+
+export default async function handler(req, res) {
   try {
-    req.rawBody = req.body && typeof req.body === "string" ? req.body : JSON.stringify(req.body || {});
-    verifySlackRequest(req);
-  } catch (e) {
-    return res.status(401).send("Slack verification failed: " + e.message);
+    const payload = req.body;
+
+    // ----------------------------
+    // 1️⃣ Slack URL Verification
+    // ----------------------------
+    if (payload.type === "url_verification") {
+      return res.status(200).send(payload.challenge);
+    }
+
+    // ----------------------------
+    // 2️⃣ Slash Command (/ai)
+    // ----------------------------
+    if (req.body.command) {
+      // Immediate response (required by Slack!)
+      res.status(200).json({
+        response_type: "ephemeral",
+        text: "Processing your request…",
+      });
+
+      // Process in background
+      setTimeout(async () => {
+        const question = req.body.text || "What is the summary?";
+
+        const doc = await loadSheet();
+        const sheet = doc.sheetsByIndex[0];
+        const rows = await sheet.getRows();
+        const rowData = rows.map(r => r._rawData);
+
+        const aiAnswer = await askGemini(question, rowData);
+
+        // Send final answer back to Slack
+        await fetch(req.body.response_url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: aiAnswer }),
+        });
+      }, 500);
+
+      return;
+    }
+
+    // ----------------------------
+    // 3️⃣ Regular Message Events
+    // ----------------------------
+    if (payload.event?.type === "app_mention") {
+      const question = payload.event.text;
+
+      const doc = await loadSheet();
+      const sheet = doc.sheetsByIndex[0];
+      const rows = await sheet.getRows();
+      const rowData = rows.map(r => r._rawData);
+
+      const aiAnswer = await askGemini(question, rowData);
+
+      // Reply back to Slack
+      await fetch("https://slack.com/api/chat.postMessage", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          channel: payload.event.channel,
+          text: aiAnswer,
+        }),
+      });
+
+      return res.status(200).send("OK");
+    }
+
+    return res.status(200).send("OK");
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send("Internal Error");
   }
-
-  const body = req.body;
-
-  // Slack URL challenge
-  if (body.type === "url_verification") {
-    return res.json({ challenge: body.challenge });
-  }
-
-  /**********************************************
-   SLASH COMMAND HANDLER: /finance
-  **********************************************/
-  if (req.headers["content-type"]?.includes("application/x-www-form-urlencoded")) {
-    const text = body.text || "";
-    const channel = body.channel_id;
-
-    res.status(200).send("Processing…");
-
-    // async background processing
-    (async () => {
-      if (text.startsWith("pending")) {
-        return await handlePending(text, channel);
-      }
-      if (text.startsWith("cashflow") || text.startsWith("cash")) {
-        return await handleCashflow(text, channel);
-      }
-      return await sendSlackMessage(channel, "Unknown command.");
-    })();
-
-    return;
-  }
-
-  /**********************************************
-   EVENT HANDLER (mentions, messages)
-  **********************************************/
-  if (body.event) {
-    res.status(200).send("ok"); // immediate ACK
-
-    const evt = body.event;
-
-    if (evt.bot_id) return;
-
-    const channel = evt.channel;
-    let text = evt.text || "";
-    text = text.replace(/<@[^>]+>/, "").trim();
-
-    await sendSlackMessage(channel, `<@${evt.user}> Processing…`);
-
-    if (/pending/i.test(text)) return await handlePending(text, channel);
-    if (/cashflow|cash flow|cash/i.test(text)) return await handleCashflow(text, channel);
-
-    return await sendSlackMessage(channel, "Please type: pending or cashflow");
-  }
-
-  res.status(200).send("ok");
-};
-
-/**************************************
-  PENDING HANDLER
-**************************************/
-async function handlePending(text, channel) {
-  const rows = await readPendingPayments();
-
-  const mapped = rows.map((r) => ({
-    invoiceNo: r[0] || "(no)",
-    client: r[1] || "",
-    invoiceDate: r[3] instanceof Date ? r[3] : new Date(r[3]),
-    pendingDays: Number(r[4]) || 0,
-    status: r[5] || "",
-    amount: Number(String(r[6]).replace(/[^0-9.-]/g, "")) || 0,
-  }));
-
-  const mIndex = monthIndex(text);
-  let filtered = mapped;
-
-  if (mIndex !== null) {
-    filtered = filtered.filter((x) => x.invoiceDate?.getMonth() === mIndex);
-  }
-
-  if (!filtered.length) {
-    return await sendSlackMessage(channel, `No pending results for "${text}"`);
-  }
-
-  const total = filtered.reduce((s, x) => s + x.amount, 0);
-
-  // AI summary
-  const summary = await askGemini(
-    `Summarize these pending payments. Total: ${fmt(total)}. Count: ${filtered.length}.`
-  );
-
-  const blocks = buildTableBlocks("Pending Payments", summary, filtered);
-  return await sendSlackMessage(channel, blocks);
-}
-
-/**************************************
-  CASHFLOW HANDLER
-**************************************/
-async function handleCashflow(text, channel) {
-  const rows = await readDataForChatbot();
-
-  const mapped = rows.map((r) => ({
-    invoiceNo: r[0] || "(no)",
-    client: r[1] || "",
-    invoiceDate: r[2] instanceof Date ? r[2] : new Date(r[2]),
-    amount: Number(String(r[3]).replace(/[^0-9.-]/g, "")) || 0,
-    paid: Number(String(r[4]).replace(/[^0-9.-]/g, "")) || 0,
-    status: r[6] || "",
-    pendingDays: daysBetween(r[2] instanceof Date ? r[2] : new Date(r[2])),
-  }));
-
-  const mIndex = monthIndex(text);
-  let filtered = mapped;
-
-  if (mIndex !== null) {
-    filtered = filtered.filter((x) => x.invoiceDate?.getMonth() === mIndex);
-  }
-
-  if (!filtered.length) {
-    return await sendSlackMessage(channel, `No cashflow results for "${text}"`);
-  }
-
-  const totalInv = filtered.reduce((s, x) => s + x.amount, 0);
-  const totalPaid = filtered.reduce((s, x) => s + x.paid, 0);
-
-  const summary = await askGemini(
-    `Summarize cashflow. Invoiced: ${fmt(totalInv)}, Paid: ${fmt(totalPaid)}, Pending: ${fmt(totalInv - totalPaid)}.`
-  );
-
-  const blocks = buildTableBlocks("Cashflow", summary, filtered);
-  return await sendSlackMessage(channel, blocks);
 }
