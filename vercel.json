@@ -5,7 +5,7 @@
       "src": "api/slack.js",
       "use": "@vercel/node",
       "config": {
-        "includeFiles": ["api/**/*"],
+        "includeFiles": ["api/**/**/*"],
         "maxLambdaSize": "50mb"
       }
     }
@@ -14,10 +14,7 @@
     {
       "src": "/api/slack",
       "dest": "/api/slack.js",
-      "methods": ["POST"],
-      "headers": {
-        "Content-Type": "application/json"
-      }
+      "methods": ["POST"]
     }
   ]
 }
