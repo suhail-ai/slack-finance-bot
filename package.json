@@ -1,0 +1,9 @@
+{
+  "name": "slack-finance-bot",
+  "version": "1.0.0",
+  "license": "MIT",
+  "dependencies": {
+    "googleapis": "^121.0.0",
+    "node-fetch": "^2.6.7"
+  }
+}
