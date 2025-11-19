@@ -1,17 +1,19 @@
 {
   "version": 2,
-  "functions": {
-    "api/slack.js": {
-      "runtime": "nodejs18.x",
-      "memory": 1024,
-      "maxDuration": 30
+  "builds": [
+    {
+      "src": "api/slack.js",
+      "use": "@vercel/node"
     }
-  },
+  ],
   "routes": [
     {
       "src": "/api/slack",
       "dest": "/api/slack.js",
-      "methods": ["POST"]
+      "methods": ["POST", "GET"],
+      "headers": {
+        "Content-Type": "application/json"
+      }
     }
   ]
 }
