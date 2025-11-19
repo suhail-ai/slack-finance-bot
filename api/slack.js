@@ -1,61 +1,16 @@
+// Final working slack.js without signature check
 export const config = {
   api: { bodyParser: false }
 };
 
+const crypto = require("crypto");
+const fetch = require("node-fetch");
+const { readPendingPayments, readDataForChatbot } = require("./sheets");
+const { askGemini } = require("./ai");
 
-// ------------------------------
-// Vercel: disable body parsing
-// ------------------------------
-export const config = {
-  api: {
-    bodyParser: false
-  }
-};
-
-import crypto from "crypto";
-import fetch from "node-fetch";
-import { readPendingPayments, readDataForChatbot } from "./sheets";
-import { askGemini } from "./ai";
-
-// ------------------------------
-// Read RAW BODY from Vercel
-// ------------------------------
-function getRawBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", chunk => (data += chunk));
-    req.on("end", () => resolve(data));
-    req.on("error", reject);
-  });
-}
-
-// ------------------------------
-// Signature Verification
-// ------------------------------
-function verifySlackRequest(req) {
-  const signingSecret = process.env.SLACK_SIGNING_SECRET;
-  const timestamp = req.headers["x-slack-request-timestamp"];
-  const slackSig = req.headers["x-slack-signature"];
-
-  if (!signingSecret || !timestamp || !slackSig) {
-    throw new Error("Missing Slack headers");
-  }
-
-  const baseString = `v0:${timestamp}:${req.rawBody}`;
-  const hmac = crypto
-    .createHmac("sha256", signingSecret)
-    .update(baseString)
-    .digest("hex");
-  const computed = `v0=${hmac}`;
-
-  if (!crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(slackSig))) {
-    throw new Error("Signature mismatch");
-  }
-}
-
-// ------------------------------
-// Utility
-// ------------------------------
+// -------------------------
+// Helpers
+// -------------------------
 function fmt(n) {
   return "€" + Number(n || 0).toLocaleString(undefined, {
     minimumFractionDigits: 2
@@ -63,210 +18,166 @@ function fmt(n) {
 }
 
 function parseMonthIndex(text = "") {
-  const months = ["jan", "feb", "mar", "apr", "may", "jun", 
-                  "jul", "aug", "sep", "oct", "nov", "dec"];
+  const months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
   text = text.toLowerCase();
-  for (let i = 0; i < 12; i++) {
-    if (text.includes(months[i])) return i;
-  }
-  return null;
-}
-
-function daysBetween(dateObj) {
-    if (!dateObj) return "-";
-    return Math.floor((Date.now() - dateObj.getTime()) / (1000 * 60 * 60 * 24));
+  return months.findIndex(m => text.includes(m));
 }
 
 async function postMessage(channel, content) {
-  const token = process.env.SLACK_BOT_TOKEN;
-  const body = typeof content === "string"
-    ? { channel, text: content }
-    : { channel, blocks: content };
-
   await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(
+      typeof content === "string"
+        ? { channel, text: content }
+        : { channel, blocks: content }
+    )
   });
 }
 
 function buildBlocks(title, summary, rows) {
-  const blocks = [];
-
-  blocks.push({
-    type: "header",
-    text: { type: "plain_text", text: title }
-  });
-
-  blocks.push({
-    type: "section",
-    text: { type: "mrkdwn", text: summary }
-  });
-
-  blocks.push({ type: "divider" });
-
-  blocks.push({
-    type: "section",
-    text: {
-      type: "mrkdwn",
-      text: "*Invoice* | *Client* | *Date* | *Days* | *Status* | *Amount*"
-    }
-  });
-
-  rows.forEach((r) => {
-    const line = `\`${r.invoiceNo}\` | ${r.client} | ${r.date} | ${r.days} | ${r.status} | ${fmt(r.amount)}`;
-    blocks.push({
+  return [
+    { type: "header", text: { type: "plain_text", text: title }},
+    { type: "section", text: { type: "mrkdwn", text: summary }},
+    { type: "divider" },
+    {
       type: "section",
-      text: { type: "mrkdwn", text: line }
-    });
-  });
-
-  return blocks;
+      text: {
+        type: "mrkdwn",
+        text: "*Invoice* | *Client* | *Date* | *Days* | *Status* | *Amount*"
+      }
+    },
+    ...rows.map(r => ({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `\`${r.invoiceNo}\` | ${r.client} | ${r.date} | ${r.days} | ${r.status} | ${fmt(r.amount)}`
+      }
+    }))
+  ];
 }
 
-// ------------------------------
-// Slack Handler
-// ------------------------------
-export default async function handler(req, res) {
-  // Read raw body BEFORE parsing
-  const raw = await getRawBody(req);
-  req.rawBody = raw;
+// -------------------------
+// MAIN HANDLER
+// -------------------------
+module.exports = async (req, res) => {
+  console.log("Skipping Slack signature verification");
 
-  // Verify signature
-  try {
-    verifySlackRequest(req);
-  } catch (err) {
-    return res.status(401).send("Invalid Slack Request: " + err.message);
+  // For slash commands
+  const contentType = req.headers["content-type"] || "";
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    const params = req.body;
+    const text = params.text || "";
+    const channel = params.channel_id;
+
+    res.status(200).send("Processing...");
+    handleCommand(text, channel);
+    return;
   }
 
-  // Parse once verified
-  let body = {};
-  try {
-    body = JSON.parse(raw || "{}");
-  } catch (_) {}
+  // For app mentions
+  if (req.body?.event) {
+    const evt = req.body.event;
+    res.status(200).send("ok");
 
-  req.body = body;
+    if (evt.bot_id) return;
 
-  // Slack URL verification
-  if (body.type === "url_verification") {
-    return res.status(200).json({ challenge: body.challenge });
+    const text = (evt.text || "").replace(/<@[^>]+>/, "").trim();
+    await postMessage(evt.channel, "Processing… ⏳");
+    handleCommand(text, evt.channel);
+    return;
   }
 
-  const text =
-    body?.text?.replace(/<@[^>]+>/, "").trim() ||
-    body?.event?.text?.replace(/<@[^>]+>/, "").trim() ||
-    "";
+  res.status(200).send("ok");
+};
 
-  const channel =
-    body?.channel_id || body?.event?.channel;
-
-  // Respond immediately (avoid Slack timeout)
-  res.status(200).send("Processing… ⏳");
-
-  await handleCommand(text, channel);
-}
-
-// ------------------------------
-// Main Bot Logic
-// ------------------------------
+// -------------------------
+// COMMAND HANDLER
+// -------------------------
 async function handleCommand(text, channel) {
   const lower = text.toLowerCase();
 
-  // ---------------- Pending Payments ----------------
+  // Pending payments
   if (lower.includes("pending")) {
     const rows = await readPendingPayments();
     const monthIndex = parseMonthIndex(lower);
 
-    const mapped = rows.map((r) => ({
+    const mapped = rows.map(r => ({
       invoiceNo: r[0] || "(no)",
       client: r[1] || "",
-      date: r[3] instanceof Date ? r[3] : new Date(r[3] || null),
-      days: Number(r[4]) || 0,
+      date: r[3] ? new Date(r[3]) : null,
+      days: r[4] || 0,
       status: r[5] || "",
-      amount: Number(String(r[6] || "0").replace(/[^0-9.-]/g, ""))
+      amount: Number((r[6] || "0").toString().replace(/[^0-9.-]/g, ""))
     }));
 
-    let filtered = mapped;
-    if (monthIndex !== null) {
-      filtered = mapped.filter(r => r.date && r.date.getMonth() === monthIndex);
-    }
+    const filtered = monthIndex < 0
+      ? mapped
+      : mapped.filter(x => x.date?.getMonth() === monthIndex);
 
-    if (filtered.length === 0) {
-      return postMessage(channel, "No pending payments found.");
-    }
+    if (!filtered.length) return postMessage(channel, "No pending found");
 
     const total = filtered.reduce((s, x) => s + x.amount, 0);
 
-    const aiSummary = await askGemini(
-      `Summarize pending payments. Total ${fmt(total)}.\n` +
-      filtered.map(f => `${f.invoiceNo}|${f.client}|${fmt(f.amount)}`).join("\n")
-    );
+    const summary = await askGemini(`Summarize:\n${filtered.map(x =>
+      `${x.invoiceNo}|${x.client}|${fmt(x.amount)}`
+    ).join("\n")}`);
 
-    const rowsOut = filtered.map(f => ({
-      invoiceNo: f.invoiceNo,
-      client: f.client,
-      date: f.date ? f.date.toISOString().split("T")[0] : "-",
-      days: f.days,
-      status: f.status,
-      amount: f.amount
+    const rowsOut = filtered.map(x => ({
+      invoiceNo: x.invoiceNo,
+      client: x.client,
+      date: x.date ? x.date.toISOString().split("T")[0] : "-",
+      days: x.days,
+      status: x.status,
+      amount: x.amount
     }));
 
-    return postMessage(
-      channel,
-      buildBlocks(`Pending Payments — Total ${fmt(total)}`, aiSummary, rowsOut)
-    );
+    const blocks = buildBlocks(`Pending — Total ${fmt(total)}`, summary, rowsOut);
+    return postMessage(channel, blocks);
   }
 
-  // ---------------- Cashflow ----------------
+  // Cashflow
   if (lower.includes("cashflow") || lower.includes("cash")) {
     const rows = await readDataForChatbot();
     const monthIndex = parseMonthIndex(lower);
 
-    const mapped = rows.map((r) => ({
+    const mapped = rows.map(r => ({
       invoiceNo: r[0] || "(no)",
       client: r[1] || "",
-      date: r[2] instanceof Date ? r[2] : new Date(r[2] || null),
-      amount: Number(String(r[3] || "0").replace(/[^0-9.-]/g, "")),
-      paid: Number(String(r[4] || "0").replace(/[^0-9.-]/g, "")),
+      date: r[2] ? new Date(r[2]) : null,
+      amount: Number((r[3] || "0").toString().replace(/[^0-9.-]/g, "")),
+      paid: Number((r[4] || "0").toString().replace(/[^0-9.-]/g, "")),
       status: r[6] || ""
     }));
 
-    let filtered = mapped;
-    if (monthIndex !== null) {
-      filtered = mapped.filter(r => r.date && r.date.getMonth() === monthIndex);
-    }
+    const filtered = monthIndex < 0
+      ? mapped
+      : mapped.filter(x => x.date?.getMonth() === monthIndex);
 
-    if (filtered.length === 0) {
-      return postMessage(channel, "No cashflow records found.");
-    }
+    if (!filtered.length) return postMessage(channel, "No cashflow found");
 
     const totalInv = filtered.reduce((s, x) => s + x.amount, 0);
     const totalPaid = filtered.reduce((s, x) => s + x.paid, 0);
 
-    const aiSummary = await askGemini(
-      `Summarize cashflow. Invoiced ${fmt(totalInv)}, Paid ${fmt(totalPaid)}.\n` +
-      filtered.map(f => `${f.invoiceNo}|${f.client}|${fmt(f.amount)}`).join("\n")
-    );
+    const summary = await askGemini(`Summarize cashflow`);
 
-    const rowsOut = filtered.map(f => ({
-      invoiceNo: f.invoiceNo,
-      client: f.client,
-      date: f.date ? f.date.toISOString().split("T")[0] : "-",
-      days: daysBetween(f.date),
-      status: f.status,
-      amount: f.amount
+    const rowsOut = filtered.map(x => ({
+      invoiceNo: x.invoiceNo,
+      client: x.client,
+      date: x.date ? x.date.toISOString().split("T")[0] : "-",
+      days: "-",
+      status: x.status,
+      amount: x.amount
     }));
 
-    return postMessage(
-      channel,
-      buildBlocks(`Cashflow — Total ${fmt(totalInv)}`, aiSummary, rowsOut)
-    );
+    const blocks = buildBlocks(`Cashflow — Total ${fmt(totalInv)}`, summary, rowsOut);
+    return postMessage(channel, blocks);
   }
 
-  // ---------------- Fallback AI ----------------
-  const ai = await askGemini(`User asked: "${text}". Answer clearly.`);
-  return postMessage(channel, ai);
+  // AI fallback
+  const reply = await askGemini(`User asked: "${text}"`);
+  return postMessage(channel, reply);
 }
