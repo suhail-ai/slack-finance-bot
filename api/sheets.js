@@ -3,16 +3,13 @@ const { google } = require('googleapis');
 
 const SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly'];
 
-// Create Google Sheets API client using service account
 function getJwtClient() {
-  const clientEmail = process.env.GOOGLE_SA_EMAIL;
-  const privateKey = (process.env.GOOGLE_SA_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+  const email = process.env.GOOGLE_SA_EMAIL;
+  const key = (process.env.GOOGLE_SA_PRIVATE_KEY || '').replace(/\\n/g, '\n');
 
-  if (!clientEmail || !privateKey) {
-    throw new Error('Google Service Account ENV variables not set.');
-  }
+  if (!email || !key) throw new Error("Missing Google service account env vars");
 
-  return new google.auth.JWT(clientEmail, null, privateKey, SCOPES);
+  return new google.auth.JWT(email, null, key, SCOPES);
 }
 
 async function readRange(range) {
@@ -20,23 +17,31 @@ async function readRange(range) {
   await jwt.authorize();
 
   const sheets = google.sheets({ version: 'v4', auth: jwt });
+
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: process.env.SHEET_ID,
-    range: range,
-    valueRenderOption: 'UNFORMATTED_VALUE',
+    range,
+    valueRenderOption: "UNFORMATTED_VALUE"
   });
 
   return res.data.values || [];
 }
 
-// Reads "Pending Payments" tab
+// ======================
+// SPECIFIC TABS
+// ======================
+
 async function readPendingPayments() {
+  // Tab: Pending Payments — starting row 10, cols A:J
   return await readRange(`'Pending Payments'!A10:J`);
 }
 
-// Reads "Data for chatbot" tab
 async function readDataForChatbot() {
+  // Tab: Data for chatbot — starting row 12, cols A:K
   return await readRange(`'Data for chatbot'!A12:K`);
 }
 
-module.exports = { readPendingPayments, readDataForChatbot };
+module.exports = {
+  readPendingPayments,
+  readDataForChatbot
+};
