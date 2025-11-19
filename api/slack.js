@@ -1,3 +1,8 @@
+export const config = {
+  api: { bodyParser: false }
+};
+
+
 // ------------------------------
 // Vercel: disable body parsing
 // ------------------------------
