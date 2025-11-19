@@ -1,3 +1,9 @@
+export const config = {
+  api: {
+    bodyParser: false
+  }
+};
+
 // /api/slack.js
 const crypto = require("crypto");
 const fetch = require("node-fetch");
